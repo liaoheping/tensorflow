@@ -29,7 +29,7 @@ from tensorflow.python.training import slot_creator
 
 
 # TODO(touts): switch to variables.Variable.
-def assign_moving_average(variable, value, decay, zero_debias=False, name=None):
+def assign_moving_average(variable, value, decay, zero_debias=True, name=None):
   """Compute the moving average of a variable.
 
   The moving average of 'variable' updated with 'value' is:
@@ -47,17 +47,32 @@ def assign_moving_average(variable, value, decay, zero_debias=False, name=None):
   See `ADAM: A Method for Stochastic Optimization` Section 3 for more details
   (https://arxiv.org/abs/1412.6980).
 
+  The names of the debias shadow variables, by default, include both the scope
+  they were created in and the scope of the variables they debias. They are also
+  given a uniqifying-suffix.
+
+  Ex:
+    with tf.variable_scope('scope1'):
+      with tf.variable_scope('scope2'):
+        var = tf.get_variable('foo')
+        assign_moving_average(var, 0.0, 1.0)
+        assign_moving_average(var, 0.0, 0.9)
+
+    var.name: 'scope1/scope2/foo'
+    shadow var names: 'scope1/scope2/scope1/scope2/foo/biased'
+                      'scope1/scope2/scope1/scope2/foo/biased_1'
+
   Args:
     variable: A Variable.
     value: A tensor with the same shape as 'variable'.
     decay: A float Tensor or float value.  The moving average decay.
-    zero_debias: A python bool. If true, assume the variable is 0-intialized and
-      unbias it, as in https://arxiv.org/abs/1412.6980. See docstring in
+    zero_debias: A python bool. If true, assume the variable is 0-initialized
+      and unbias it, as in https://arxiv.org/abs/1412.6980. See docstring in
       `_zero_debias` for more details.
     name: Optional name of the returned operation.
 
   Returns:
-    An Operation that updates 'variable' with the newly computed
+    A reference to the input 'variable' tensor with the newly computed
     moving average.
   """
   with ops.name_scope(name, "AssignMovingAvg",
@@ -114,18 +129,22 @@ def weighted_moving_average(value,
                                      [value, weight, decay]) as scope:
     value_x_weight_var = variable_scope.get_variable(
         "value_x_weight",
-        initializer=init_ops.zeros_initializer(value.get_shape(),
-                                               dtype=value.dtype),
+        shape=value.get_shape(),
+        dtype=value.dtype,
+        initializer=init_ops.zeros_initializer(),
         trainable=False,
         collections=collections)
     weight_var = variable_scope.get_variable(
         "weight",
-        initializer=init_ops.zeros_initializer(weight.get_shape(),
-                                               dtype=weight.dtype),
+        shape=weight.get_shape(),
+        dtype=weight.dtype,
+        initializer=init_ops.zeros_initializer(),
         trainable=False,
         collections=collections)
-    numerator = assign_moving_average(value_x_weight_var, value * weight, decay)
-    denominator = assign_moving_average(weight_var, weight, decay)
+    numerator = assign_moving_average(
+        value_x_weight_var, value * weight, decay, zero_debias=False)
+    denominator = assign_moving_average(
+        weight_var, weight, decay, zero_debias=False)
 
     if truediv:
       return math_ops.truediv(numerator, denominator, name=scope.name)
@@ -166,18 +185,32 @@ def _zero_debias(unbiased_var, value, decay):
     tensor will also update the shadow variables appropriately.
   """
   with variable_scope.variable_scope(
-      "ZeroDebias", values=[unbiased_var, value, decay]) as scope:
+      unbiased_var.op.name, values=[unbiased_var, value, decay]) as scope:
     with ops.colocate_with(unbiased_var):
+      with ops.control_dependencies(None):
+        biased_initializer = init_ops.zeros_initializer(
+            dtype=unbiased_var.dtype)(unbiased_var.get_shape())
+        local_step_initializer = init_ops.zeros_initializer()
+      def _maybe_get_unique(name):
+        """Get name for a unique variable, if not `reuse=True`."""
+        if variable_scope.get_variable_scope().reuse:
+          return name
+        vs_vars = [x.op.name for x in
+                   variable_scope.get_variable_scope().global_variables()]
+        full_name = variable_scope.get_variable_scope().name + "/" + name
+        if full_name not in vs_vars: return name
+        idx = 1
+        while full_name + ("_%d" % idx) in vs_vars:
+          idx += 1
+        return name + ("_%d" % idx)
       biased_var = variable_scope.get_variable(
-          unbiased_var.op.name + "_biased",
-          initializer=init_ops.zeros_initializer(
-              unbiased_var.get_shape(), dtype=unbiased_var.dtype),
+          _maybe_get_unique("biased"), initializer=biased_initializer,
           trainable=False)
-      # Initializing the local_step to `0` would cause problems with the
-      # debiasing equation, so we instead initialize to `1`.
       local_step = variable_scope.get_variable(
-          unbiased_var.op.name + "_local_step",
-          initializer=init_ops.ones_initializer([], dtype=unbiased_var.dtype),
+          _maybe_get_unique("local_step"),
+          shape=[],
+          dtype=unbiased_var.dtype,
+          initializer=local_step_initializer,
           trainable=False)
 
       # Get an update ops for both shadow variables.
@@ -190,8 +223,9 @@ def _zero_debias(unbiased_var, value, decay):
       # use the new values of the biased variable and the local step.
       with ops.control_dependencies([update_biased, update_local_step]):
         # This function gets `1 - decay`, so use `1.0 - decay` in the exponent.
-        unbiased_ema_delta = (unbiased_var - biased_var.ref() /
-                              (1 - math_ops.pow(1.0 - decay, local_step.ref())))
+        unbiased_ema_delta = (unbiased_var - biased_var.read_value() /
+                              (1 - math_ops.pow(
+                                  1.0 - decay, local_step.read_value())))
 
       return unbiased_ema_delta
 
@@ -263,7 +297,7 @@ class ExponentialMovingAverage(object):
      for a given variable.
   *  Build a model normally but load the checkpoint files to evaluate by using
      the shadow variable names.  For this use the `average_name()` method.  See
-     the [Saver class](../../api_docs/python/train.md#Saver) for more
+     the @{tf.train.Saver} for more
      information on restoring saved variables.
 
   Example of restoring the shadow variable values:
@@ -276,15 +310,10 @@ class ExponentialMovingAverage(object):
   saver.restore(...checkpoint filename...)
   # var0 and var1 now hold the moving average values
   ```
-
-  @@__init__
-  @@apply
-  @@average_name
-  @@average
-  @@variables_to_restore
   """
 
-  def __init__(self, decay, num_updates=None, name="ExponentialMovingAverage"):
+  def __init__(self, decay, num_updates=None, zero_debias=False,
+               name="ExponentialMovingAverage"):
     """Creates a new ExponentialMovingAverage object.
 
     The `apply()` method has to be called to create shadow variables and add
@@ -301,11 +330,14 @@ class ExponentialMovingAverage(object):
     Args:
       decay: Float.  The decay to use.
       num_updates: Optional count of number of updates applied to variables.
+      zero_debias: If `True`, zero debias moving-averages that are initialized
+        with tensors.
       name: String. Optional prefix name to use for the name of ops added in
         `apply()`.
     """
     self._decay = decay
     self._num_updates = num_updates
+    self._zero_debias = zero_debias
     self._name = name
     self._averages = {}
 
@@ -321,7 +353,7 @@ class ExponentialMovingAverage(object):
 
     shadow variables are created with `trainable=False` and added to the
     `GraphKeys.ALL_VARIABLES` collection.  They will be returned by calls to
-    `tf.all_variables()`.
+    `tf.global_variables()`.
 
     Returns an op that updates all shadow variables as described above.
 
@@ -343,6 +375,7 @@ class ExponentialMovingAverage(object):
     # TODO(touts): op_scope
     if var_list is None:
       var_list = variables.trainable_variables()
+    zero_debias_true = set()  # set of vars to set `zero_debias=True`
     for var in var_list:
       if var.dtype.base_dtype not in [dtypes.float16, dtypes.float32,
                                       dtypes.float64]:
@@ -367,7 +400,9 @@ class ExponentialMovingAverage(object):
           avg = slot_creator.create_zeros_slot(
               var,
               self._name,
-              colocate_with_primary=(var.op.type == "Variable"))
+              colocate_with_primary=(var.op.type in ["Variable", "VariableV2"]))
+          if self._zero_debias:
+            zero_debias_true.add(avg)
       self._averages[var] = avg
 
     with ops.name_scope(self._name) as scope:
@@ -380,7 +415,9 @@ class ExponentialMovingAverage(object):
                                  (1.0 + num_updates) / (10.0 + num_updates))
       updates = []
       for var in var_list:
-        updates.append(assign_moving_average(self._averages[var], var, decay))
+        zero_debias = self._averages[var] in zero_debias_true
+        updates.append(assign_moving_average(
+            self._averages[var], var, decay, zero_debias=zero_debias))
       return control_flow_ops.group(*updates, name=scope)
 
   def average(self, var):
